@@ -1,5 +1,5 @@
 # --- Discord ---
-bot_token: "${DISCORD_BOT_TOKEN}"  # NE PAS METTRE LE TOKEN ICI
+bot_token: "MTQxMjkyMzk2MDI0MDExMTczOA.Ge6N9r.IrIp-HYRm_mOfGT_xZSA4l_ezPVbXiQHkx3pqw"  # NE PAS METTRE LE TOKEN ICI
 client_id: "${DISCORD_CLIENT_ID}"  # NE PAS METTRE L'ID ICI
 status_message: "DM IA West Marches | /model"
 allow_dms: false
