@@ -1,44 +1,39 @@
 # --- Discord ---
-bot_token: null                     # on n'utilise PAS cette valeur (le code lit DISCORD_BOT_TOKEN depuis l'environnement)
-client_id: "${DISCORD_CLIENT_ID}"   # Application ID (chiffres) fourni côté Render -> Environment
+bot_token: null
+client_id: "${DISCORD_CLIENT_ID}"
 status_message: "DM IA West Marches | /model"
 allow_dms: false
 
-# --- Permissions & filtres (structure complète) ---
 permissions:
   users:
-    admin_ids: []        # <<< clé OBLIGATOIRE pour éviter les erreurs (mets ici tes ID si tu veux des admins)
-    allowed_ids: []      # vide = tout le monde autorisé (sauf si roles/channels limitent)
+    admin_ids: []        # <<< clé OBLIGATOIRE
+    allowed_ids: []
     blocked_ids: []
   roles:
-    allowed_ids: []      # vide = pas de filtre par rôles
+    allowed_ids: []
     blocked_ids: []
   channels:
-    allowed_ids: []      # vide = le bot peut répondre partout
+    allowed_ids: []
     blocked_ids: []
 
-# --- LLM (Groq, OpenAI-compatible) ---
 providers:
   groq:
     base_url: "https://api.groq.com/openai/v1"
-    api_key: "${GROQ_API_KEY}"   # définie dans Render -> Environment
+    api_key: "${GROQ_API_KEY}"
 
-# --- Modèles disponibles ---
 models:
   groq/llama-3.1-8b-instant:
     temperature: 0.7
     top_p: 0.9
     max_output_tokens: 1024
 
-# --- Persona / règles d'arbitrage ---
 system_prompt: |
   Tu es le DM IA d’un West Marches PbP D&D 5e.
   - Cadre la scène, pose les enjeux, propose au plus 3 actions.
   - Les JETS et RÈGLES sont gérés par Avrae (ne lance PAS les dés).
-  - Quand un jet est requis, suggère une commande Avrae (ex. `!check perception`, `!check survival`, `!init`, etc.).
+  - Quand un jet est requis, suggère une commande Avrae (ex. `!check perception`, `!check survival`, `!init`).
   - Après qu’un joueur poste le résultat Avrae, décris brièvement la conséquence.
   - Style: court, clair, FR (2–5 phrases).
 
-# --- Limites de contexte ---
 max_messages: 25
 use_plain_responses: false
