@@ -1,3 +1,4 @@
+import os
 import asyncio
 from base64 import b64encode
 from dataclasses import dataclass, field
@@ -33,6 +34,20 @@ MAX_MESSAGE_NODES = 500
 def get_config(filename: str = "config.yaml") -> dict[str, Any]:
     with open(filename, encoding="utf-8") as file:
         return yaml.safe_load(file)
+
+
+def resolve_bot_token(cfg: dict[str, Any]) -> str:
+    """
+    Renvoie le token en priorité depuis l'environnement DISCORD_BOT_TOKEN.
+    Si absent, tente cfg["bot_token"]. Lève une erreur explicite sinon.
+    """
+    token_env = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
+    if token_env and not token_env.startswith("${"):
+        return token_env
+    token_cfg = (cfg.get("bot_token") or "").strip()
+    if token_cfg:
+        return token_cfg
+    raise RuntimeError("Aucun token trouvé : définis la variable d'environnement DISCORD_BOT_TOKEN ou renseigne bot_token dans config.yaml")
 
 
 config = get_config()
@@ -336,7 +351,10 @@ async def on_message(new_msg: discord.Message) -> None:
 
 
 async def main() -> None:
-    await discord_bot.start(config["bot_token"])
+    # IMPORTANT : lire le token depuis l'environnement en priorité
+    token = resolve_bot_token(config)
+    logging.info("Starting Discord bot with token from environment" if "DISCORD_BOT_TOKEN" in os.environ and os.environ.get("DISCORD_BOT_TOKEN") else "Starting Discord bot with token from config.yaml")
+    await discord_bot.start(token)
 
 
 try:
