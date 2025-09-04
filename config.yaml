@@ -25,12 +25,11 @@ providers:
       HTTP-Referer: "https://dm-ai-h2mc.onrender.com"   # ou l'URL Render de ton service
       X-Title: "West Marches DM Bot"
 
-# --- Modèle (GPT-5 nano via OpenRouter) ---
 models:
   openrouter/openai/gpt-5-nano:
     temperature: 0.2
     top_p: 0.8
-    max_tokens: 800
+    max_tokens: 1200  # (au lieu de 800)
 
 # --- System prompt (Dungeon Master persona) ---
 system_prompt: |
@@ -83,6 +82,6 @@ system_prompt: |
     * (If result is 10) → "The guard shakes his head firmly, unmoved by your words."
     * (If result is 18) → "The guard sighs and grudgingly steps aside, muttering about broken rules."
 
-# --- Context limit ---
-max_messages: 8
-use_plain_responses: false
+# Limiter le contexte
+max_messages: 8       # (au lieu de 25)
+max_text: 4000        # tronque chaque message long
