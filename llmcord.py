@@ -37,7 +37,6 @@ def get_config(filename: str = "config.yaml") -> dict[str, Any]:
 
 
 def resolve_bot_token(cfg: dict[str, Any]) -> str:
-    """Prend le token depuis DISCORD_BOT_TOKEN (env) ou cfg['bot_token'] si présent."""
     token_env = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
     if token_env and not token_env.startswith("${"):
         return token_env
@@ -48,15 +47,8 @@ def resolve_bot_token(cfg: dict[str, Any]) -> str:
 
 
 def resolve_api_key(provider_name: str, provider_cfg: dict[str, Any]) -> str:
-    """
-    Lit la clé API du provider, dans cet ordre :
-    1) si provider_cfg['api_key'] est de la forme '${ENV_VAR}', lit os.environ['ENV_VAR']
-    2) sinon, essaye une env par convention selon le provider (OPENROUTER_API_KEY, GROQ_API_KEY, etc.)
-    3) sinon, prend provider_cfg['api_key'] si c'est une valeur littérale (non '${...}')
-    """
     raw = (provider_cfg.get("api_key") or "").strip()
 
-    # cas "${ENV_VAR}" -> extraire ENV_VAR et lire l'environnement
     if raw.startswith("${") and raw.endswith("}"):
         env_var = raw[2:-1].strip()
         val = os.environ.get(env_var, "").strip()
@@ -64,7 +56,6 @@ def resolve_api_key(provider_name: str, provider_cfg: dict[str, Any]) -> str:
             return val
         raise RuntimeError(f"Missing environment variable: {env_var}")
 
-    # heuristique par provider (fallback si l'on n'a pas mis ${...} dans le YAML)
     fallback_env_map = {
         "openrouter": "OPENROUTER_API_KEY",
         "groq": "GROQ_API_KEY",
@@ -78,7 +69,6 @@ def resolve_api_key(provider_name: str, provider_cfg: dict[str, Any]) -> str:
         if val:
             return val
 
-    # valeur littérale éventuelle
     if raw and not raw.startswith("${"):
         return raw
 
@@ -211,8 +201,16 @@ async def on_message(new_msg: discord.Message) -> None:
     provider_config = cfg["providers"][provider]
 
     base_url = provider_config["base_url"].strip()
-    api_key = resolve_api_key(provider, provider_config)  # <-- lit la bonne clé selon le provider
-    openai_client = AsyncOpenAI(base_url=base_url, api_key=api_key)
+    api_key = resolve_api_key(provider, provider_config)
+
+    # Client OpenAI-compatible avec timeouts raisonnables
+    openai_client = AsyncOpenAI(
+        base_url=base_url,
+        api_key=api_key,
+        timeout=60.0,  # secondes
+        max_retries=2,
+        http_client=httpx.AsyncClient(timeout=httpx.Timeout(60.0))
+    )
 
     model_parameters = cfg["models"].get(provider_slash_model, None)
 
@@ -223,7 +221,6 @@ async def on_message(new_msg: discord.Message) -> None:
     extra_body = {}
     extra_body.update(provider_config.get("extra_body", {}) or {})
     extra_body.update(model_parameters or {})
-    # map 'max_output_tokens' -> 'max_tokens' si besoin (certaines APIs n'acceptent pas max_output_tokens)
     if "max_output_tokens" in extra_body and "max_tokens" not in extra_body:
         extra_body["max_tokens"] = extra_body.pop("max_output_tokens")
     if not extra_body:
@@ -318,6 +315,7 @@ async def on_message(new_msg: discord.Message) -> None:
         f"Message received (user ID: {new_msg.author.id}, attachments: {len(new_msg.attachments)}, conversation length: {len(messages)}):\n{new_msg.content}"
     )
 
+    # Ajout du prompt système
     if system_prompt := config.get("system_prompt"):
         now = datetime.now().astimezone()
         system_prompt = system_prompt.replace("{date}", now.strftime("%B %d %Y")).replace("{time}", now.strftime("%H:%M:%S %Z%z")).strip()
@@ -325,82 +323,85 @@ async def on_message(new_msg: discord.Message) -> None:
             system_prompt += "\n\nUser's names are their Discord IDs and should be typed as '<@ID>'."
         messages.append(dict(role="system", content=system_prompt))
 
-    # Generate and send response message(s)
-    curr_content = finish_reason = None
+    # Prépare la réponse
     response_msgs: list[discord.Message] = []
     response_contents: list[str] = []
 
-    openai_kwargs = dict(model=model, messages=messages[::-1], stream=True, extra_headers=extra_headers, extra_query=extra_query, extra_body=extra_body)
+    # --- IMPORTANT : pas de streaming sur OpenRouter (workaround blocages) ---
+    use_stream = (provider.lower() != "openrouter")
 
-    if use_plain_responses := config.get("use_plain_responses", False):
-        max_message_length = 4000
-    else:
-        max_message_length = 4096 - len(STREAMING_INDICATOR)
-        embed = discord.Embed.from_dict(dict(fields=[dict(name=warning, value="", inline=False) for warning in sorted(user_warnings)]))
+    openai_kwargs = dict(
+        model=model,
+        messages=messages[::-1],
+        stream=use_stream,
+        extra_headers=extra_headers,
+        extra_query=extra_query,
+        extra_body=extra_body
+    )
 
-    async def reply_helper(**reply_kwargs) -> None:
+    async def reply_helper_embed(text: str, final: bool) -> None:
+        nonlocal response_msgs, last_task_time
+        embed = discord.Embed(description=text, color=(EMBED_COLOR_COMPLETE if final else EMBED_COLOR_INCOMPLETE))
         reply_target = new_msg if not response_msgs else response_msgs[-1]
-        response_msg = await reply_target.reply(**reply_kwargs)
-        response_msgs.append(response_msg)
-
-        msg_nodes[response_msg.id] = MsgNode(parent_msg=new_msg)
-        await msg_nodes[response_msg.id].lock.acquire()
+        if not response_msgs:
+            msg = await reply_target.reply(embed=embed, silent=True)
+            response_msgs.append(msg)
+        else:
+            await response_msgs[-1].edit(embed=embed)
+        last_task_time = datetime.now().timestamp()
 
     try:
         async with new_msg.channel.typing():
-            async for chunk in await openai_client.chat.completions.create(**openai_kwargs):
-                if finish_reason is not None:
-                    break
+            if use_stream:
+                # Streaming (Groq, autres)
+                max_message_length = 4096 - len(STREAMING_INDICATOR)
+                await reply_helper_embed(STREAMING_INDICATOR, final=False)
 
-                if not (choice := (chunk.choices[0] if chunk.choices else None)):
-                    continue
+                curr_content = ""
+                got_any_chunk = False
+                stream = await openai_client.chat.completions.create(**openai_kwargs)
 
-                finish_reason = choice.finish_reason
+                async for chunk in stream:
+                    choice = chunk.choices[0] if chunk.choices else None
+                    if not choice:
+                        continue
+                    delta = choice.delta.content or ""
+                    if not delta:
+                        continue
+                    got_any_chunk = True
+                    curr_content += delta
 
-                prev_content = curr_content or ""
-                curr_content = choice.delta.content or ""
-                new_content = prev_content if finish_reason is None else (prev_content + curr_content)
+                    # édition périodique
+                    if len(curr_content) >= 50:
+                        text = (curr_content[-(max_message_length - len(STREAMING_INDICATOR)):] + STREAMING_INDICATOR)
+                        await reply_helper_embed(text, final=False)
 
-                if response_contents == [] and new_content == "":
-                    continue
+                if not got_any_chunk:
+                    # aucun token reçu -> fallback message court
+                    await reply_helper_embed("… (no content)", final=True)
+                else:
+                    await reply_helper_embed(curr_content, final=True)
 
-                if start_next_msg := (response_contents == [] or len(response_contents[-1] + new_content) > max_message_length):
-                    response_contents.append("")
+                response_contents.append(curr_content or "")
 
-                response_contents[-1] += new_content
-
-                if not use_plain_responses:
-                    time_delta = datetime.now().timestamp() - last_task_time
-
-                    ready_to_edit = time_delta >= EDIT_DELAY_SECONDS
-                    msg_split_incoming = finish_reason is None and len(response_contents[-1] + curr_content) > max_message_length
-                    is_final_edit = finish_reason is not None or msg_split_incoming
-                    is_good_finish = (finish_reason is not None and str(finish_reason).lower() in ("stop", "end_turn"))
-
-                    if start_next_msg or ready_to_edit or is_final_edit:
-                        embed.description = response_contents[-1] if is_final_edit else (response_contents[-1] + STREAMING_INDICATOR)
-                        embed.color = EMBED_COLOR_COMPLETE if (msg_split_incoming or is_good_finish) else EMBED_COLOR_INCOMPLETE
-
-                        if start_next_msg:
-                            await reply_helper(embed=embed, silent=True)
-                        else:
-                            await asyncio.sleep(max(0, EDIT_DELAY_SECONDS - time_delta))
-                            await response_msgs[-1].edit(embed=embed)
-
-                        last_task_time = datetime.now().timestamp()
-
-            if use_plain_responses:
-                for content in response_contents:
-                    await reply_helper(view=LayoutView().add_item(TextDisplay(content=content)))
+            else:
+                # Non-streaming (OpenRouter)
+                resp = await openai_client.chat.completions.create(**openai_kwargs)
+                content = (resp.choices[0].message.content or "").strip()
+                if not content:
+                    content = "*(No response content received from the model.)*"
+                response_contents.append(content)
+                await reply_helper_embed(content, final=True)
 
     except Exception:
         logging.exception("Error while generating response")
 
+    # Enregistre le contenu généré dans le cache local
     for response_msg in response_msgs:
         msg_nodes[response_msg.id].text = "".join(response_contents)
         msg_nodes[response_msg.id].lock.release()
 
-    # Delete oldest MsgNodes (lowest message IDs) from the cache
+    # GC du cache
     if (num_nodes := len(msg_nodes)) > MAX_MESSAGE_NODES:
         for msg_id in sorted(msg_nodes.keys())[: num_nodes - MAX_MESSAGE_NODES]:
             async with msg_nodes.setdefault(msg_id, MsgNode()).lock:
