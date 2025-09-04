@@ -47,19 +47,42 @@ def resolve_bot_token(cfg: dict[str, Any]) -> str:
     raise RuntimeError("Aucun token trouvé : définis DISCORD_BOT_TOKEN dans l'environnement ou bot_token dans config.yaml")
 
 
-def resolve_api_key(provider_cfg: dict[str, Any]) -> str:
+def resolve_api_key(provider_name: str, provider_cfg: dict[str, Any]) -> str:
     """
-    Lit la clé LLM d'abord dans l'env (GROQ_API_KEY), sinon dans le YAML.
-    Évite d'envoyer la chaîne littérale '${GROQ_API_KEY}'.
+    Lit la clé API du provider, dans cet ordre :
+    1) si provider_cfg['api_key'] est de la forme '${ENV_VAR}', lit os.environ['ENV_VAR']
+    2) sinon, essaye une env par convention selon le provider (OPENROUTER_API_KEY, GROQ_API_KEY, etc.)
+    3) sinon, prend provider_cfg['api_key'] si c'est une valeur littérale (non '${...}')
     """
-    # Nom d'env standard pour Groq
-    env_key = os.environ.get("GROQ_API_KEY", "").strip()
-    if env_key and not env_key.startswith("${"):
-        return env_key
-    cfg_key = (provider_cfg.get("api_key") or "").strip()
-    if cfg_key and not cfg_key.startswith("${"):
-        return cfg_key
-    raise RuntimeError("Aucune clé LLM valide : définis GROQ_API_KEY côté hébergeur (Render → Environment).")
+    raw = (provider_cfg.get("api_key") or "").strip()
+
+    # cas "${ENV_VAR}" -> extraire ENV_VAR et lire l'environnement
+    if raw.startswith("${") and raw.endswith("}"):
+        env_var = raw[2:-1].strip()
+        val = os.environ.get(env_var, "").strip()
+        if val:
+            return val
+        raise RuntimeError(f"Missing environment variable: {env_var}")
+
+    # heuristique par provider (fallback si l'on n'a pas mis ${...} dans le YAML)
+    fallback_env_map = {
+        "openrouter": "OPENROUTER_API_KEY",
+        "groq": "GROQ_API_KEY",
+        "openai": "OPENAI_API_KEY",
+        "x-ai": "XAI_API_KEY",
+        "mistral": "MISTRAL_API_KEY",
+    }
+    env_var = fallback_env_map.get(provider_name.lower())
+    if env_var:
+        val = os.environ.get(env_var, "").strip()
+        if val:
+            return val
+
+    # valeur littérale éventuelle
+    if raw and not raw.startswith("${"):
+        return raw
+
+    raise RuntimeError(f"No API key found for provider '{provider_name}'. Check your environment variables.")
 
 
 config = get_config()
@@ -188,14 +211,23 @@ async def on_message(new_msg: discord.Message) -> None:
     provider_config = cfg["providers"][provider]
 
     base_url = provider_config["base_url"].strip()
-    api_key = resolve_api_key(provider_config)  # <-- LIT LA CLÉ DANS L'ENV OU YAML
+    api_key = resolve_api_key(provider, provider_config)  # <-- lit la bonne clé selon le provider
     openai_client = AsyncOpenAI(base_url=base_url, api_key=api_key)
 
     model_parameters = cfg["models"].get(provider_slash_model, None)
 
     extra_headers = provider_config.get("extra_headers", None)
     extra_query = provider_config.get("extra_query", None)
-    extra_body = (provider_config.get("extra_body", None) or {}) | (model_parameters or {}) or None
+
+    # ---- normalisation des paramètres pour l'API OpenAI-compatible ----
+    extra_body = {}
+    extra_body.update(provider_config.get("extra_body", {}) or {})
+    extra_body.update(model_parameters or {})
+    # map 'max_output_tokens' -> 'max_tokens' si besoin (certaines APIs n'acceptent pas max_output_tokens)
+    if "max_output_tokens" in extra_body and "max_tokens" not in extra_body:
+        extra_body["max_tokens"] = extra_body.pop("max_output_tokens")
+    if not extra_body:
+        extra_body = None
 
     accept_images = any(x in provider_slash_model.lower() for x in VISION_MODEL_TAGS)
     accept_usernames = any(x in provider_slash_model.lower() for x in PROVIDERS_SUPPORTING_USERNAMES)
