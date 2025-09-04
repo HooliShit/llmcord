@@ -19,6 +19,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s: %(message)s",
 )
 
+# Heuristiques pour vision / usernames
 VISION_MODEL_TAGS = ("claude", "gemini", "gemma", "gpt-4", "gpt-5", "grok-4", "llama", "llava", "mistral", "o3", "o4", "vision", "vl")
 PROVIDERS_SUPPORTING_USERNAMES = ("openai", "x-ai")
 
@@ -37,6 +38,7 @@ def get_config(filename: str = "config.yaml") -> dict[str, Any]:
 
 
 def resolve_bot_token(cfg: dict[str, Any]) -> str:
+    """Token depuis DISCORD_BOT_TOKEN (env) ou cfg['bot_token']."""
     token_env = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
     if token_env and not token_env.startswith("${"):
         return token_env
@@ -47,8 +49,15 @@ def resolve_bot_token(cfg: dict[str, Any]) -> str:
 
 
 def resolve_api_key(provider_name: str, provider_cfg: dict[str, Any]) -> str:
+    """
+    Lit la clé API du provider, dans cet ordre :
+    1) si provider_cfg['api_key'] est de la forme '${ENV_VAR}', lit os.environ['ENV_VAR']
+    2) sinon, essaye une env par convention selon le provider (OPENROUTER_API_KEY, GROQ_API_KEY, etc.)
+    3) sinon, prend provider_cfg['api_key'] si c'est une valeur littérale (non '${...}')
+    """
     raw = (provider_cfg.get("api_key") or "").strip()
 
+    # cas "${ENV_VAR}"
     if raw.startswith("${") and raw.endswith("}"):
         env_var = raw[2:-1].strip()
         val = os.environ.get(env_var, "").strip()
@@ -56,6 +65,7 @@ def resolve_api_key(provider_name: str, provider_cfg: dict[str, Any]) -> str:
             return val
         raise RuntimeError(f"Missing environment variable: {env_var}")
 
+    # fallback par provider
     fallback_env_map = {
         "openrouter": "OPENROUTER_API_KEY",
         "groq": "GROQ_API_KEY",
@@ -69,6 +79,7 @@ def resolve_api_key(provider_name: str, provider_cfg: dict[str, Any]) -> str:
         if val:
             return val
 
+    # valeur littérale éventuelle
     if raw and not raw.startswith("${"):
         return raw
 
@@ -203,11 +214,11 @@ async def on_message(new_msg: discord.Message) -> None:
     base_url = provider_config["base_url"].strip()
     api_key = resolve_api_key(provider, provider_config)
 
-    # Client OpenAI-compatible avec timeouts raisonnables
+    # Client OpenAI-compatible avec timeouts
     openai_client = AsyncOpenAI(
         base_url=base_url,
         api_key=api_key,
-        timeout=60.0,  # secondes
+        timeout=60.0,
         max_retries=2,
         http_client=httpx.AsyncClient(timeout=httpx.Timeout(60.0))
     )
@@ -216,11 +227,10 @@ async def on_message(new_msg: discord.Message) -> None:
 
     extra_headers = provider_config.get("extra_headers", None)
     extra_query = provider_config.get("extra_query", None)
-
-    # ---- normalisation des paramètres pour l'API OpenAI-compatible ----
     extra_body = {}
     extra_body.update(provider_config.get("extra_body", {}) or {})
     extra_body.update(model_parameters or {})
+    # normalisation des paramètres
     if "max_output_tokens" in extra_body and "max_tokens" not in extra_body:
         extra_body["max_tokens"] = extra_body.pop("max_output_tokens")
     if not extra_body:
@@ -233,11 +243,10 @@ async def on_message(new_msg: discord.Message) -> None:
     max_images = cfg.get("max_images", 5) if accept_images else 0
     max_messages = cfg.get("max_messages", 25)
 
-    # Build message chain and set user warnings
+    # --- construire l’historique ---
     messages = []
     user_warnings = set()
     curr_msg = new_msg
-
     while curr_msg is not None and len(messages) < max_messages:
         curr_node = msg_nodes.setdefault(curr_msg.id, MsgNode())
 
@@ -265,57 +274,48 @@ async def on_message(new_msg: discord.Message) -> None:
                 curr_node.user_id = curr_msg.author.id if curr_node.role == "user" else None
                 curr_node.has_bad_attachments = len(curr_msg.attachments) > len(good_atts)
 
-                try:
-                    if (
-                        curr_msg.reference is None
-                        and discord_bot.user.mention not in curr_msg.content
-                        and (prev_msg := ([m async for m in curr_msg.channel.history(before=curr_msg, limit=1)] or [None])[0])
-                        and prev_msg.type in (discord.MessageType.default, discord.MessageType.reply)
-                        and prev_msg.author == (discord_bot.user if curr_msg.channel.type == discord.ChannelType.private else curr_msg.author)
-                    ):
-                        curr_node.parent_msg = prev_msg
-                    else:
-                        is_public_thread = curr_msg.channel.type == discord.ChannelType.public_thread
-                        parent_is_thread_start = is_public_thread and curr_msg.reference is None and curr_msg.channel.parent.type == discord.ChannelType.text
-
-                        if parent_msg_id := (curr_msg.channel.id if parent_is_thread_start else getattr(curr_msg.reference, "message_id", None)):
-                            if parent_is_thread_start:
-                                curr_node.parent_msg = curr_msg.channel.starter_message or await curr_msg.channel.parent.fetch_message(parent_msg_id)
-                            else:
-                                curr_node.parent_msg = curr_msg.reference.cached_message or await curr_msg.channel.fetch_message(parent_msg_id)
-
-                except (discord.NotFound, discord.HTTPException):
-                    logging.exception("Error fetching next message in the chain")
-                    curr_node.fetch_parent_failed = True
-
-            if curr_node.images[:max_images]:
-                content = ([dict(type="text", text=curr_node.text[:max_text])] if curr_node.text[:max_text] else []) + curr_node.images[:max_images]
+        # chaînage vers le parent
+        try:
+            if (
+                curr_msg.reference is None
+                and discord_bot.user.mention not in curr_msg.content
+                and (prev_msg := ([m async for m in curr_msg.channel.history(before=curr_msg, limit=1)] or [None])[0])
+                and prev_msg.type in (discord.MessageType.default, discord.MessageType.reply)
+                and prev_msg.author == (discord_bot.user if curr_msg.channel.type == discord.ChannelType.private else curr_msg.author)
+            ):
+                parent_msg = prev_msg
             else:
-                content = curr_node.text[:max_text]
+                is_public_thread = curr_msg.channel.type == discord.ChannelType.public_thread
+                parent_is_thread_start = is_public_thread and curr_msg.reference is None and curr_msg.channel.parent.type == discord.ChannelType.text
+                parent_msg = None
+                if parent_msg_id := (curr_msg.channel.id if parent_is_thread_start else getattr(curr_msg.reference, "message_id", None)):
+                    if parent_is_thread_start:
+                        parent_msg = curr_msg.channel.starter_message or await curr_msg.channel.parent.fetch_message(parent_msg_id)
+                    else:
+                        parent_msg = curr_msg.reference.cached_message or await curr_msg.channel.fetch_message(parent_msg_id)
+            msg_nodes[curr_msg.id].parent_msg = parent_msg
+        except (discord.NotFound, discord.HTTPException):
+            logging.exception("Error fetching next message in the chain")
+            msg_nodes[curr_msg.id].fetch_parent_failed = True
 
-            if content != "":
-                message = dict(content=content, role=curr_node.role)
-                if accept_usernames and curr_node.user_id is not None:
-                    message["name"] = str(curr_node.user_id)
+        # push message courant
+        if msg_nodes[curr_msg.id].images[:max_images]:
+            content = ([dict(type="text", text=msg_nodes[curr_msg.id].text[:max_text])] if msg_nodes[curr_msg.id].text[:max_text] else []) + msg_nodes[curr_msg.id].images[:max_images]
+        else:
+            content = msg_nodes[curr_msg.id].text[:max_text]
 
-                messages.append(message)
+        if content != "":
+            message = dict(content=content, role=msg_nodes[curr_msg.id].role)
+            if accept_usernames and msg_nodes[curr_msg.id].user_id is not None:
+                message["name"] = str(msg_nodes[curr_msg.id].user_id)
+            messages.append(message)
 
-            if len(curr_node.text or "") > max_text:
-                user_warnings.add(f"⚠️ Max {max_text:,} characters per message")
-            if len(curr_node.images) > max_images:
-                user_warnings.add(f"⚠️ Max {max_images} image{'' if max_images == 1 else 's'} per message" if max_images > 0 else "⚠️ Can't see images")
-            if curr_node.has_bad_attachments:
-                user_warnings.add("⚠️ Unsupported attachments")
-            if curr_node.fetch_parent_failed or (curr_node.parent_msg is not None and len(messages) == max_messages):
-                user_warnings.add(f"⚠️ Only using last {len(messages)} message{'' if len(messages) == 1 else 's'}")
+        # remonter
+        curr_msg = msg_nodes[curr_msg.id].parent_msg
 
-            curr_msg = curr_node.parent_msg
+    logging.info(f"Message received (user {new_msg.author.id}, conv length {len(messages)}): {new_msg.content}")
 
-    logging.info(
-        f"Message received (user ID: {new_msg.author.id}, attachments: {len(new_msg.attachments)}, conversation length: {len(messages)}):\n{new_msg.content}"
-    )
-
-    # Ajout du prompt système
+    # --- system prompt ---
     if system_prompt := config.get("system_prompt"):
         now = datetime.now().astimezone()
         system_prompt = system_prompt.replace("{date}", now.strftime("%B %d %Y")).replace("{time}", now.strftime("%H:%M:%S %Z%z")).strip()
@@ -323,13 +323,11 @@ async def on_message(new_msg: discord.Message) -> None:
             system_prompt += "\n\nUser's names are their Discord IDs and should be typed as '<@ID>'."
         messages.append(dict(role="system", content=system_prompt))
 
-    # Prépare la réponse
     response_msgs: list[discord.Message] = []
     response_contents: list[str] = []
 
-    # --- IMPORTANT : pas de streaming sur OpenRouter (workaround blocages) ---
+    # IMPORTANT : pas de streaming sur OpenRouter (évite "typing… puis rien")
     use_stream = (provider.lower() != "openrouter")
-
     openai_kwargs = dict(
         model=model,
         messages=messages[::-1],
@@ -348,19 +346,17 @@ async def on_message(new_msg: discord.Message) -> None:
             response_msgs.append(msg)
         else:
             await response_msgs[-1].edit(embed=embed)
+        # assure la présence du nœud pour éviter KeyError
+        node = msg_nodes.setdefault(response_msgs[-1].id, MsgNode(parent_msg=new_msg))
+        node.text = text  # dernière version affichée
         last_task_time = datetime.now().timestamp()
 
     try:
         async with new_msg.channel.typing():
             if use_stream:
-                # Streaming (Groq, autres)
-                max_message_length = 4096 - len(STREAMING_INDICATOR)
-                await reply_helper_embed(STREAMING_INDICATOR, final=False)
-
-                curr_content = ""
-                got_any_chunk = False
+                # Streaming (Groq, etc.)
                 stream = await openai_client.chat.completions.create(**openai_kwargs)
-
+                curr_content = ""
                 async for chunk in stream:
                     choice = chunk.choices[0] if chunk.choices else None
                     if not choice:
@@ -368,44 +364,69 @@ async def on_message(new_msg: discord.Message) -> None:
                     delta = choice.delta.content or ""
                     if not delta:
                         continue
-                    got_any_chunk = True
                     curr_content += delta
 
-                    # édition périodique
-                    if len(curr_content) >= 50:
-                        text = (curr_content[-(max_message_length - len(STREAMING_INDICATOR)):] + STREAMING_INDICATOR)
-                        await reply_helper_embed(text, final=False)
+                if not curr_content:
+                    curr_content = "*(No streaming content received.)*"
 
-                if not got_any_chunk:
-                    # aucun token reçu -> fallback message court
-                    await reply_helper_embed("… (no content)", final=True)
-                else:
-                    await reply_helper_embed(curr_content, final=True)
-
-                response_contents.append(curr_content or "")
+                response_contents.append(curr_content)
+                await reply_helper_embed(curr_content, final=True)
 
             else:
-                # Non-streaming (OpenRouter)
+                # Non-streaming (OpenRouter) — fallbacks + logs
                 resp = await openai_client.chat.completions.create(**openai_kwargs)
-                content = (resp.choices[0].message.content or "").strip()
+
+                # Log brut (tronqué) pour inspection
+                try:
+                    import json
+                    raw = json.dumps(resp.to_dict() if hasattr(resp, "to_dict") else resp, ensure_ascii=False)
+                    logging.info(f"[OpenRouter raw resp] {raw[:2000]}")
+                except Exception:
+                    logging.exception("Failed to log raw OpenRouter response")
+
+                content = ""
+                try:
+                    # format OpenAI standard
+                    content = (resp.choices[0].message.content or "").strip()
+                except Exception:
+                    content = ""
+
                 if not content:
-                    content = "*(No response content received from the model.)*"
+                    try:
+                        # certains renvoient .text
+                        content = getattr(resp.choices[0], "text", "").strip()
+                    except Exception:
+                        pass
+
+                if not content:
+                    try:
+                        # rare : liste de messages/fragments
+                        msgs = getattr(resp.choices[0], "messages", None)
+                        if isinstance(msgs, list):
+                            content = "\n".join(str(m.get("content") or "") for m in msgs if isinstance(m, dict)).strip()
+                    except Exception:
+                        pass
+
+                if not content:
+                    reason = getattr(resp.choices[0], "finish_reason", None)
+                    content = f"*(Model returned no text{' – reason: ' + reason if reason else ''}.)*"
+
                 response_contents.append(content)
                 await reply_helper_embed(content, final=True)
 
     except Exception:
         logging.exception("Error while generating response")
 
-    # Enregistre le contenu généré dans le cache local
-    for response_msg in response_msgs:
-        msg_nodes[response_msg.id].text = "".join(response_contents)
-        msg_nodes[response_msg.id].lock.release()
+    # --- Mise à jour du cache des réponses produites ---
+    final_text = "".join(response_contents)
+    for rm in response_msgs:
+        node = msg_nodes.setdefault(rm.id, MsgNode(parent_msg=new_msg))
+        node.text = final_text
 
     # GC du cache
     if (num_nodes := len(msg_nodes)) > MAX_MESSAGE_NODES:
         for msg_id in sorted(msg_nodes.keys())[: num_nodes - MAX_MESSAGE_NODES]:
-            async with msg_nodes.setdefault(msg_id, MsgNode()).lock:
-                msg_nodes.pop(msg_id, None)
+            msg_nodes.pop(msg_id, None)
 
 
 async def main() -> None:
