@@ -372,7 +372,7 @@ async def on_message(new_msg: discord.Message) -> None:
                 response_contents.append(curr_content)
                 await reply_helper_embed(curr_content, final=True)
 
-                       else:
+            else:
                 # Non-streaming (OpenRouter) — fallbacks + logs + auto-continue
                 async def one_call(msgs):
                     resp_local = await openai_client.chat.completions.create(
