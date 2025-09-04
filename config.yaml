@@ -16,16 +16,19 @@ permissions:
     allowed_ids: []
     blocked_ids: []
 
-# --- Providers ---
+# --- Provider OpenRouter ---
 providers:
   openrouter:
     base_url: "https://openrouter.ai/api/v1"
     api_key: "${OPENROUTER_API_KEY}"
+    extra_headers:
+      HTTP-Referer: "https://dm-ai-h2mc.onrender.com"   # ou l'URL Render de ton service
+      X-Title: "West Marches DM Bot"
 
-# --- Models ---
+# --- Modèle (GPT-5 nano via OpenRouter) ---
 models:
-  openrouter/meta-llama/llama-3.1-8b-instruct:
-    temperature: 0.3
+  openrouter/openai/gpt-5-nano:
+    temperature: 0.2
     top_p: 0.8
     max_tokens: 800
 
