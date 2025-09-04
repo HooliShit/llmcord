@@ -25,7 +25,7 @@ models:
   groq/llama-3.1-8b-instant:
     temperature: 0.7
     top_p: 0.9
-    max_output_tokens: 1024
+    max_tokens: 1024
 
 system_prompt: |
   Tu es le DM IA d’un West Marches PbP D&D 5e.
