@@ -372,47 +372,64 @@ async def on_message(new_msg: discord.Message) -> None:
                 response_contents.append(curr_content)
                 await reply_helper_embed(curr_content, final=True)
 
-            else:
-                # Non-streaming (OpenRouter) — fallbacks + logs
-                resp = await openai_client.chat.completions.create(**openai_kwargs)
-
-                # Log brut (tronqué) pour inspection
-                try:
-                    import json
-                    raw = json.dumps(resp.to_dict() if hasattr(resp, "to_dict") else resp, ensure_ascii=False)
-                    logging.info(f"[OpenRouter raw resp] {raw[:2000]}")
-                except Exception:
-                    logging.exception("Failed to log raw OpenRouter response")
-
-                content = ""
-                try:
-                    # format OpenAI standard
-                    content = (resp.choices[0].message.content or "").strip()
-                except Exception:
-                    content = ""
-
-                if not content:
+                       else:
+                # Non-streaming (OpenRouter) — fallbacks + logs + auto-continue
+                async def one_call(msgs):
+                    resp_local = await openai_client.chat.completions.create(
+                        model=model,
+                        messages=msgs,
+                        stream=False,
+                        extra_headers=extra_headers,
+                        extra_query=extra_query,
+                        extra_body=extra_body
+                    )
+                    # Log brut (tronqué)
                     try:
-                        # certains renvoient .text
-                        content = getattr(resp.choices[0], "text", "").strip()
+                        import json
+                        raw = json.dumps(resp_local.to_dict() if hasattr(resp_local, "to_dict") else resp_local, ensure_ascii=False)
+                        logging.info(f"[OpenRouter raw resp] {raw[:2000]}")
                     except Exception:
-                        pass
-
-                if not content:
+                        logging.exception("Failed to log raw OpenRouter response")
+                    # Extraction de contenu (fallbacks)
+                    txt = ""
                     try:
-                        # rare : liste de messages/fragments
-                        msgs = getattr(resp.choices[0], "messages", None)
-                        if isinstance(msgs, list):
-                            content = "\n".join(str(m.get("content") or "") for m in msgs if isinstance(m, dict)).strip()
+                        txt = (resp_local.choices[0].message.content or "").strip()
                     except Exception:
-                        pass
+                        txt = ""
+                    if not txt:
+                        try:
+                            txt = getattr(resp_local.choices[0], "text", "").strip()
+                        except Exception:
+                            pass
+                    if not txt:
+                        try:
+                            msgs_list = getattr(resp_local.choices[0], "messages", None)
+                            if isinstance(msgs_list, list):
+                                txt = "\n".join(str(m.get("content") or "") for m in msgs_list if isinstance(m, dict)).strip()
+                        except Exception:
+                            pass
+                    reason = getattr(resp_local.choices[0], "finish_reason", None)
+                    return txt, (reason or "")
+                
+                # 1ère requête
+                content, reason = await one_call(messages[::-1])
+                accumulated = content
 
-                if not content:
-                    reason = getattr(resp.choices[0], "finish_reason", None)
-                    content = f"*(Model returned no text{' – reason: ' + reason if reason else ''}.)*"
+                # Si coupé par longueur, on relance 1-2 fois "Continue"
+                continue_budget = 2
+                while reason == "length" and continue_budget > 0:
+                    # Ajoute la réponse partielle comme contexte et demande la suite
+                    cont_messages = messages[::-1] + [
+                        {"role": "assistant", "content": (accumulated or "")[-3000:]},  # recentrer sur la fin
+                        {"role": "user", "content": "Continue exactly where you stopped. Keep the same style, format, and point-of-view."}
+                    ]
+                    more, reason = await one_call(cont_messages)
+                    accumulated += ("\n" + more) if more else ""
+                    continue_budget -= 1
 
-                response_contents.append(content)
-                await reply_helper_embed(content, final=True)
+                final_content = accumulated.strip() if accumulated else f"*(Model returned no text{' – reason: ' + reason if reason else ''}.)*"
+                response_contents.append(final_content)
+                await reply_helper_embed(final_content, final=True)
 
     except Exception:
         logging.exception("Error while generating response")
